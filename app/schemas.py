@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import (
+    ASN_MAX,
+    ASN_MIN,
+    AS_PATH_LIMIT,
+    AS_RELATIONSHIP_LIMIT,
     MINIMIZE_POLICY_RULE_LIMIT,
+    REL_PEER,
     _MAX_PREFIXLEN,
     _parse_nameserver,
     _parse_reverse_cidr,
     _validate_reverse_batch,
+    as_relationship_token,
     parse_address,
     parse_key_hex,
     parse_network,
@@ -760,4 +766,195 @@ class RoaCoverageResponse(BaseModel):
             "candidate region, sorted by network address; the pieces tile "
             "the whole scope."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /as-relationship-repair
+# ---------------------------------------------------------------------------
+
+#: 32-bit AS number. ``strict=True`` also rejects booleans (``true``/``false``
+#: coerce to int under Pydantic's default lax mode) and non-integer JSON.
+ASN = Annotated[int, Field(strict=True, ge=ASN_MIN, le=ASN_MAX)]
+
+
+def _as_pair(left: object, right: object) -> tuple[int, int]:
+    """Return the canonical undirected ``(lo, hi)`` pair of two ASN values.
+
+    Both values are already range-checked by the strict ASN field type; this
+    helper additionally rejects equal endpoints and orders the pair.
+    """
+    if left == right:
+        raise ValueError("a relationship must link two different AS numbers")
+    return (left, right) if left < right else (right, left)  # type: ignore[return-value]
+
+
+class AsRelationship(BaseModel):
+    """One undirected AS relationship: a directed c2p link or a peer link.
+
+    Customer-provider entries name the ``customer`` and the ``provider``;
+    peer entries name the two equal peers (in either order).  The ``type``
+    discriminator selects which fields must be present.
+    """
+
+    type: Literal["customer_provider", "peer"] = Field(
+        description=(
+            "'customer_provider' names a customer and its provider; 'peer' "
+            "names two equal peers (no direction)."
+        ),
+    )
+    customer: ASN | None = Field(
+        default=None,
+        description="Customer ASN; present (and required) for customer_provider.",
+    )
+    provider: ASN | None = Field(
+        default=None,
+        description="Provider ASN; present (and required) for customer_provider.",
+    )
+    peers: list[ASN] | None = Field(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="Exactly two distinct peer ASNs; required for peer.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "AsRelationship":
+        if self.type == "customer_provider":
+            if self.peers is not None:
+                raise ValueError(
+                    "a customer_provider relationship must not carry 'peers'"
+                )
+            if self.customer is None or self.provider is None:
+                raise ValueError(
+                    "a customer_provider relationship requires 'customer' "
+                    "and 'provider'"
+                )
+            if self.customer == self.provider:
+                raise ValueError(
+                    "customer and provider must be different AS numbers"
+                )
+        else:  # peer
+            if self.customer is not None or self.provider is not None:
+                raise ValueError(
+                    "a peer relationship must not carry 'customer'/'provider'"
+                )
+            if self.peers is None or len(self.peers) != 2:
+                raise ValueError(
+                    "a peer relationship requires exactly two 'peers'"
+                )
+            if self.peers[0] == self.peers[1]:
+                raise ValueError("the two peers must be different AS numbers")
+        return self
+
+    def canonical_pair(self) -> tuple[int, int]:
+        """Canonical undirected ``(lo, hi)`` pair of this relationship."""
+        if self.type == "customer_provider":
+            return _as_pair(self.customer, self.provider)
+        return _as_pair(self.peers[0], self.peers[1])
+
+    def token(self) -> int:
+        """Canonical relationship token (see ``app.policy``)."""
+        if self.type == "peer":
+            return REL_PEER
+        return as_relationship_token(self.customer, self.provider)
+
+
+class AsRelationshipRepairRequest(BaseModel):
+    relationships: list[AsRelationship] = Field(
+        default_factory=list,
+        max_length=AS_RELATIONSHIP_LIMIT,
+        description=(
+            f"Undirected AS relationships, at most {AS_RELATIONSHIP_LIMIT}. "
+            "A customer_provider entry names customer/provider; a peer entry "
+            "names two equal peers. The same AS pair must be listed once."
+        ),
+    )
+    paths: list[list[ASN]] = Field(
+        default_factory=list,
+        max_length=AS_PATH_LIMIT,
+        description=(
+            f"Origin-to-receiver AS paths, at most {AS_PATH_LIMIT}. Every "
+            "path is a non-empty list of distinct 32-bit AS numbers; each "
+            "consecutive pair must have a relationship."
+        ),
+    )
+
+    @field_validator("paths")
+    @classmethod
+    def _validate_paths(cls, values: list[list[int]]) -> list[list[int]]:
+        # Element type/range errors already come from the strict ASN item
+        # type; this only rejects empty paths and repeated ASes in one path.
+        for path in values:
+            if not path:
+                raise ValueError(
+                    "an AS path must contain at least one AS number"
+                )
+            if len(set(path)) != len(path):
+                raise ValueError(
+                    f"AS path {path} repeats an AS number; every path must "
+                    f"have no duplicate AS"
+                )
+        return values
+
+    @model_validator(mode="after")
+    def _validate_pairs_and_hops(self) -> "AsRelationshipRepairRequest":
+        # Cross-entry rules become one whole-model ValueError -> HTTP 422,
+        # exactly like the /allocate and /reverse-delegations batches.
+        pairs: set[tuple[int, int]] = set()
+        for relationship in self.relationships:
+            pair = relationship.canonical_pair()
+            if pair in pairs:
+                raise ValueError(
+                    f"duplicate relationship for AS pair {pair[0]}/{pair[1]}; "
+                    f"each AS pair must be listed at most once"
+                )
+            pairs.add(pair)
+
+        for path_index, path in enumerate(self.paths):
+            for left, right in zip(path, path[1:]):
+                pair = _as_pair(left, right)
+                if pair not in pairs:
+                    raise ValueError(
+                        f"hop {left}->{right} of path {path_index} has no "
+                        f"relationship; every hop pair must be listed"
+                    )
+        return self
+
+
+class AsRelationshipCorrection(BaseModel):
+    """One changed relationship after repair (same shape as an input entry)."""
+
+    type: Literal["customer_provider", "peer"] = Field(
+        description="The repaired relationship type.",
+    )
+    customer: ASN | None = Field(
+        default=None,
+        description="Customer ASN; null unless type is customer_provider.",
+    )
+    provider: ASN | None = Field(
+        default=None,
+        description="Provider ASN; null unless type is customer_provider.",
+    )
+    peers: list[ASN] | None = Field(
+        default=None,
+        description="Two distinct peer ASNs; null unless type is peer.",
+    )
+
+
+class AsRelationshipRepairResponse(BaseModel):
+    violating_path_indices: list[int] = Field(
+        description=(
+            "0-based indices of paths that already violated the valley-free "
+            "rule under the original relationships, in ascending order."
+        ),
+    )
+    corrections: list[AsRelationshipCorrection] = Field(
+        description=(
+            "Relationships changed by the unique minimum repair, sorted by "
+            "canonical AS pair (lower ASN first)."
+        ),
+    )
+    changes: int = Field(
+        description="Number of relationships changed (len(corrections)).",
     )

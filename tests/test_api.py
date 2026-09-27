@@ -1815,3 +1815,396 @@ def test_roa_coverage_is_documented_in_openapi():
     ]
     response_schema = spec["components"]["schemas"]["RoaCoverageResponse"]
     assert set(response_schema["properties"]) == {"partitions"}
+
+# --------------------------------------------------------------------------
+# POST /as-relationship-repair
+# --------------------------------------------------------------------------
+
+AS_REPAIR_SHARED = {
+    "relationships": [
+        {"type": "customer_provider", "customer": 200, "provider": 100},
+        {"type": "customer_provider", "customer": 200, "provider": 300},
+        {"type": "customer_provider", "customer": 200, "provider": 400},
+    ],
+    "paths": [[100, 200, 300], [400, 200, 300]],
+}
+
+AS_REPAIR_INFEASIBLE = {
+    "relationships": [
+        {"type": "customer_provider", "customer": 1, "provider": 2},
+        {"type": "customer_provider", "customer": 3, "provider": 1},
+        {"type": "peer", "peers": [1, 4]},
+        {"type": "customer_provider", "customer": 2, "provider": 3},
+        {"type": "customer_provider", "customer": 4, "provider": 3},
+    ],
+    "paths": [
+        [4, 3, 2, 1],
+        [2, 1, 3, 4],
+        [4, 1, 3, 2],
+        [3, 4, 1, 2],
+    ],
+}
+
+
+def test_as_relationship_repair_shared_single_flip():
+    response = client.post("/as-relationship-repair", json=AS_REPAIR_SHARED)
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_path_indices": [0, 1],
+        "corrections": [
+            {"type": "customer_provider", "customer": 300,
+             "provider": 200, "peers": None},
+        ],
+        "changes": 1,
+    }
+
+
+def test_as_relationship_repair_already_valley_free():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 1, "provider": 2},
+                {"type": "customer_provider", "customer": 3, "provider": 2},
+            ],
+            "paths": [[1, 2, 3]],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_path_indices": [],
+        "corrections": [],
+        "changes": 0,
+    }
+
+
+def test_as_relationship_repair_peer_summit_path():
+    # up, peer, down needs no repair.
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 1, "provider": 2},
+                {"type": "peer", "peers": [2, 3]},
+                {"type": "customer_provider", "customer": 4, "provider": 3},
+            ],
+            "paths": [[1, 2, 3, 4]],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["changes"] == 0
+    assert response.json()["violating_path_indices"] == []
+
+
+def test_as_relationship_repair_peer_endpoint_order_is_directionless():
+    # Listing peers in either order is the same undirected relationship.
+    body = {
+        "relationships": [{"type": "peer", "peers": [300, 100]}],
+        "paths": [[100, 300]],
+    }
+    response = client.post("/as-relationship-repair", json=body)
+    assert response.status_code == 200
+    assert response.json()["changes"] == 0
+
+
+def test_as_relationship_repair_single_as_and_empty_body():
+    response = client.post(
+        "/as-relationship-repair",
+        json={"relationships": [], "paths": [[7]]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_path_indices": [], "corrections": [], "changes": 0,
+    }
+    response = client.post("/as-relationship-repair", json={})
+    assert response.status_code == 200
+    assert response.json()["changes"] == 0
+
+
+def test_as_relationship_repair_lexicographic_tie_break():
+    # Two one-flip repairs; the full sorted new-relationship sequence flips
+    # the smaller pair (100,200) to customer 100/provider 200.
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 200,
+                 "provider": 100},
+                {"type": "customer_provider", "customer": 200,
+                 "provider": 300},
+            ],
+            "paths": [[100, 200, 300]],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["changes"] == 1
+    assert data["corrections"] == [
+        {"type": "customer_provider", "customer": 100, "provider": 200,
+         "peers": None},
+    ]
+
+
+def test_as_relationship_repair_unused_relationship_is_left_untouched():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 200,
+                 "provider": 100},
+                {"type": "customer_provider", "customer": 200,
+                 "provider": 300},
+                {"type": "peer", "peers": [900, 901]},
+            ],
+            "paths": [[100, 200, 300]],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["changes"] == 1
+    assert all(
+        item.get("customer", item.get("peers")) not in (900, 901)
+        and item.get("provider") not in (900, 901)
+        for item in data["corrections"]
+    )
+
+
+def test_as_relationship_repair_infeasible_returns_409():
+    response = client.post(
+        "/as-relationship-repair", json=AS_REPAIR_INFEASIBLE
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert "violating_path_indices" not in body
+    assert "corrections" not in body
+    assert "changes" not in body
+    assert "valley-free" in body["detail"]
+
+
+def test_as_relationship_repair_409_example_has_five_edges_four_paths():
+    # The documented infeasible witness uses exactly 5 relationships/4 paths.
+    assert len(AS_REPAIR_INFEASIBLE["relationships"]) == 5
+    assert len(AS_REPAIR_INFEASIBLE["paths"]) == 4
+
+
+def test_as_relationship_repair_missing_relationship_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 200,
+                 "provider": 100},
+            ],
+            "paths": [[100, 200, 300]],
+        },
+    )
+    assert response.status_code == 422
+    # Cross-entry check fails at the whole-model validator.
+    assert response.json()["detail"][0]["loc"] == ["body"]
+    assert "no relationship" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_duplicate_as_in_path_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "peer", "peers": [1, 2]}],
+            "paths": [[1, 2, 1]],
+        },
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "paths" for err in response.json()["detail"])
+    assert "duplicate AS" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_empty_path_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={"relationships": [], "paths": [[]]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "paths" for err in response.json()["detail"])
+
+
+def test_as_relationship_repair_duplicate_pair_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 1,
+                 "provider": 2},
+                {"type": "peer", "peers": [2, 1]},
+            ],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body"]
+    assert "duplicate relationship" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_self_relationship_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={"relationships": [{"type": "peer", "peers": [5, 5]}],
+              "paths": []},
+    )
+    assert response.status_code == 422
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any(loc[-2:] == ("relationships", 0) for loc in locs)
+
+
+def test_as_relationship_repair_shape_errors_return_422():
+    cases = [
+        # customer_provider must not carry peers
+        {"relationships": [
+            {"type": "customer_provider", "customer": 1, "peers": [2, 3]}],
+         "paths": []},
+        # customer_provider missing provider
+        {"relationships": [
+            {"type": "customer_provider", "customer": 1}], "paths": []},
+        # peer missing peers
+        {"relationships": [{"type": "peer"}], "paths": []},
+        # peer carrying customer/provider
+        {"relationships": [
+            {"type": "peer", "customer": 1, "provider": 2, "peers": [3, 4]}],
+         "paths": []},
+        # three peers
+        {"relationships": [
+            {"type": "peer", "peers": [1, 2, 3]}], "paths": []},
+        # unknown type
+        {"relationships": [{"type": "sibling", "a": 1}], "paths": []},
+    ]
+    for body in cases:
+        response = client.post("/as-relationship-repair", json=body)
+        assert response.status_code == 422, body
+
+
+def test_as_relationship_repair_asn_errors_return_422():
+    cases = [
+        {"relationships": [], "paths": [[4294967296]]},
+        {"relationships": [], "paths": [[-1]]},
+        {"relationships": [{"type": "peer", "peers": [True, 2]}],
+         "paths": []},
+        {"relationships": [{"type": "peer", "peers": ["1", 2]}],
+         "paths": []},
+        {"relationships": [
+            {"type": "customer_provider", "customer": None,
+             "provider": 2}],
+         "paths": []},
+        {"relationships": [
+            {"type": "customer_provider", "customer": 1.5,
+             "provider": 2}],
+         "paths": []},
+    ]
+    for body in cases:
+        response = client.post("/as-relationship-repair", json=body)
+        assert response.status_code == 422, body
+
+
+def test_as_relationship_repair_asn_boundaries_accepted():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "customer_provider", "customer": 4294967295,
+                 "provider": 0},
+            ],
+            "paths": [[4294967295, 0]],
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_as_relationship_repair_limit_boundaries():
+    # Exactly 9 relationships accepted; a 9-edge chain valley-free with 20
+    # paths must stay inside both limits.
+    relationships = [
+        {"type": "peer", "peers": [i, i + 100]} for i in range(1, 10)
+    ]
+    paths = [[i, i + 100] for i in range(1, 10)]
+    response = client.post(
+        "/as-relationship-repair",
+        json={"relationships": relationships, "paths": paths},
+    )
+    assert response.status_code == 200
+
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "peer", "peers": [1, 2]}],
+            "paths": [[1, 2]] * 20,
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_as_relationship_repair_more_than_nine_relationships_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "peer", "peers": [i, 100 + i]} for i in range(10)
+            ],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+    assert "9" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_more_than_twenty_paths_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "peer", "peers": [1, 2]}],
+            "paths": [[1, 2]] * 21,
+        },
+    )
+    assert response.status_code == 422
+    assert "20" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_wrong_container_types_return_422():
+    for body in (
+        {"relationships": {}, "paths": []},
+        {"relationships": [], "paths": {}},
+        {"relationships": "x", "paths": []},
+        {"paths": [{"not": "a list"}]},
+        {"paths": [123]},
+    ):
+        response = client.post("/as-relationship-repair", json=body)
+        assert response.status_code == 422, body
+
+
+def test_as_relationship_repair_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/as-relationship-repair" in spec["paths"]
+    operation = spec["paths"]["/as-relationship-repair"]["post"]
+    assert "200" in operation["responses"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "one_shared_repair" in examples
+    assert "no_feasible_repair" in examples
+    assert "missing_relationship" in examples
+    response_examples = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert "one_shared_repair" in response_examples
+    schema = spec["components"]["schemas"]["AsRelationshipRepairResponse"]
+    assert set(schema["properties"]) == {
+        "violating_path_indices", "corrections", "changes",
+    }
+    correction_schema = spec["components"]["schemas"][
+        "AsRelationshipCorrection"
+    ]
+    assert set(correction_schema["properties"]) == {
+        "type", "customer", "provider", "peers",
+    }
+    assert correction_schema["properties"]["type"]["enum"] == [
+        "customer_provider", "peer",
+    ]

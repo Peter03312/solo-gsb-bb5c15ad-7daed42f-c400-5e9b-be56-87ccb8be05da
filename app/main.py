@@ -1,6 +1,6 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
 /audit-rules, /minimize-policy, /allocate, /anonymize,
-/reverse-delegations and /roa-coverage."""
+/reverse-delegations, /roa-coverage and /as-relationship-repair."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from app.policy import (
     allocate,
     anonymize,
+    as_relationship_repair,
     audit_rules,
     compare,
     evaluate,
@@ -23,6 +24,8 @@ from app.schemas import (
     AllocateResponse,
     AnonymizeRequest,
     AnonymizeResponse,
+    AsRelationshipRepairRequest,
+    AsRelationshipRepairResponse,
     AuditRulesRequest,
     AuditRulesResponse,
     CompareRequest,
@@ -53,11 +56,14 @@ app = FastAPI(
         "and strict CIDRs with an HMAC-SHA256 key for safe list sharing; "
         "and plan reverse-DNS delegations for the IPv4 networks of one /24 "
         "(direct in-addr.arpa NS for a /24, RFC 2317 range-label subzones "
-        "plus per-address CNAMEs for /25-/32); and map RPKI ROA "
+        "plus per-address CNAMEs for /25-/32); map RPKI ROA "
         "valid/invalid/unknown coverage for every candidate route of one "
-        "prefix length inside a scope as a minimal CIDR status partition."
+        "prefix length inside a scope as a minimal CIDR status partition; "
+        "and repair the minimum number of undirected AS customer-provider/"
+        "peer relationships so every supplied origin-to-receiver AS path is "
+        "valley-free (up*, at most one peer, down*)."
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -947,3 +953,137 @@ def roa_coverage_report(request: RoaCoverageRequest) -> dict:
         request.prefix_length,
         [(item.cidr, item.asn, item.max_length) for item in request.roas],
     )
+
+
+@app.post(
+    "/as-relationship-repair",
+    response_model=AsRelationshipRepairResponse,
+    tags=["policy"],
+    summary="Repair the fewest AS relationships so all paths are valley-free",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "one_shared_repair": {
+                            "summary": (
+                                "Both paths form the same provider->customer "
+                                "then customer->provider valley; flipping the "
+                                "shared relationship repairs both at once"
+                            ),
+                            "value": {
+                                "relationships": [
+                                    {"type": "customer_provider",
+                                     "customer": 200, "provider": 100},
+                                    {"type": "customer_provider",
+                                     "customer": 200, "provider": 300},
+                                    {"type": "customer_provider",
+                                     "customer": 200, "provider": 400},
+                                ],
+                                "paths": [
+                                    [100, 200, 300],
+                                    [400, 200, 300],
+                                ],
+                            },
+                        },
+                        "no_feasible_repair": {
+                            "summary": (
+                                "Four paths jointly demand contradictory "
+                                "orientations for every relabeling -> "
+                                "HTTP 409"
+                            ),
+                            "value": {
+                                "relationships": [
+                                    {"type": "customer_provider",
+                                     "customer": 1, "provider": 2},
+                                    {"type": "customer_provider",
+                                     "customer": 3, "provider": 1},
+                                    {"type": "peer",
+                                     "peers": [1, 4]},
+                                    {"type": "customer_provider",
+                                     "customer": 2, "provider": 3},
+                                    {"type": "customer_provider",
+                                     "customer": 4, "provider": 3},
+                                ],
+                                "paths": [
+                                    [4, 3, 2, 1],
+                                    [2, 1, 3, 4],
+                                    [4, 1, 3, 2],
+                                    [3, 4, 1, 2],
+                                ],
+                            },
+                        },
+                        "missing_relationship": {
+                            "summary": "A hop without a relationship -> HTTP 422",
+                            "value": {
+                                "relationships": [
+                                    {"type": "customer_provider",
+                                     "customer": 200, "provider": 100},
+                                ],
+                                "paths": [[100, 200, 300]],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "Indices of paths violating the original relationships, the "
+                "unique minimum-cardinality repair, and its change count."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "one_shared_repair": {
+                            "summary": "One flipped relationship repairs both paths",
+                            "value": {
+                                "violating_path_indices": [0, 1],
+                                "corrections": [
+                                    {"type": "customer_provider",
+                                     "customer": 300, "provider": 200},
+                                ],
+                                "changes": 1,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        409: {
+            "description": (
+                "No assignment of the relationships makes every supplied "
+                "path valley-free; no repair is returned."
+            ),
+        },
+        422: {
+            "description": (
+                "More than 9 relationships or 20 paths, a malformed "
+                "relationship entry, a duplicate AS pair, an empty path, a "
+                "repeated AS inside one path, a hop pair without a "
+                "relationship, or an ASN outside the 32-bit range."
+            ),
+        },
+    },
+)
+def repair_as_relationships(request: AsRelationshipRepairRequest) -> dict:
+    result = as_relationship_repair(
+        [
+            (entry.canonical_pair(), entry.token())
+            for entry in request.relationships
+        ],
+        [list(path) for path in request.paths],
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no assignment of the supplied relationships makes every AS "
+                "path valley-free (up*, at most one peer, down*)"
+            ),
+        )
+    return result

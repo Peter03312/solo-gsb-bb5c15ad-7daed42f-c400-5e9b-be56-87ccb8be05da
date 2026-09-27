@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import random
 
 import pytest
@@ -2230,3 +2231,380 @@ def test_roa_random_shorter_length_cases_return_empty():
         ))
         length = rng.randint(0, scope_len - 1)
         assert roa_coverage(str(scope), 1, length, []) == {"partitions": []}
+
+
+# ---------------------------------------------------------------------------
+# as-relationship-repair: minimum-cardinality valley-free repair
+# ---------------------------------------------------------------------------
+
+from app.policy import (  # noqa: E402
+    AS_PATH_LIMIT,
+    AS_RELATIONSHIP_LIMIT,
+    REL_HI_CUSTOMER,
+    REL_LO_CUSTOMER,
+    REL_PEER,
+    _hop_kind,
+    as_relationship_repair,
+    as_relationship_token,
+)
+
+#: Build the public response-style relationship dict for one canonical pair.
+def _as_entry(pair, token):
+    """Build the public response-style dict for one repaired pair/token."""
+    lo, hi = pair
+    if token == REL_PEER:
+        return {"type": "peer", "peers": [lo, hi]}
+    if token == REL_LO_CUSTOMER:
+        return {"type": "customer_provider", "customer": lo, "provider": hi}
+    return {"type": "customer_provider", "customer": hi, "provider": lo}
+
+
+def _brute_force_repair(relationships, paths):
+    """Independent reference: enumerate all 3^n relationship assignments."""
+    original = dict(relationships)
+    used = sorted({
+        pair
+        for path in paths
+        for left, right in zip(path, path[1:])
+        for pair in (tuple(sorted((left, right))),)
+    })
+
+    def vf(path, tokens):
+        state = "U"
+        for left, right in zip(path, path[1:]):
+            pair = tuple(sorted((left, right)))
+            kind = _hop_kind(left, right, tokens[pair])
+            if kind == "U":
+                if state != "U":
+                    return False
+            elif kind == "P":
+                if state != "U":
+                    return False
+                state = "P"
+            else:
+                state = "D"
+        return True
+
+    best = None
+    for combo in itertools.product((0, 1, 2), repeat=len(used)):
+        tokens = dict(zip(used, combo))
+        if not all(vf(path, tokens) for path in paths):
+            continue
+        changed = tuple(
+            (pair, token)
+            for pair, token in zip(used, combo)
+            if token != original[pair]
+        )
+        full_seq = tuple(combo)
+        key = (len(changed), full_seq)
+        if best is None or key < best[0]:
+            best = (key, changed)
+    if best is None:
+        return None
+    return [_as_entry(pair, token) for pair, token in best[1]]
+
+
+def test_as_token_orientation_helpers():
+    assert as_relationship_token(1, 2) == REL_LO_CUSTOMER
+    assert as_relationship_token(2, 1) == REL_HI_CUSTOMER
+    # Endpoint order is irrelevant for the canonical code.
+    assert as_relationship_token(2, 1) == as_relationship_token(2, 1)
+
+
+def test_as_repair_shared_single_flip_repairs_two_paths():
+    # Both paths go provider->customer (down) into AS 200 and then
+    # customer->provider (up) out of it: the same valley on the shared
+    # 200/300 edge; reversing that one relationship repairs both paths.
+    relationships = [
+        ((100, 200), REL_HI_CUSTOMER),  # customer 200, provider 100
+        ((200, 300), REL_LO_CUSTOMER),  # customer 200, provider 300
+        ((200, 400), REL_LO_CUSTOMER),  # customer 200, provider 400
+    ]
+    paths = [[100, 200, 300], [400, 200, 300]]
+    result = as_relationship_repair(relationships, paths)
+    assert result == {
+        "violating_path_indices": [0, 1],
+        "corrections": [
+            {"type": "customer_provider", "customer": 300, "provider": 200},
+        ],
+        "changes": 1,
+    }
+
+
+def test_as_repair_all_valley_free_returns_zero_changes():
+    # 1 -> 2 -> 3 is up then down: 1 customer of 2, 3 customer of 2.
+    relationships = [
+        ((1, 2), REL_LO_CUSTOMER),
+        ((2, 3), REL_HI_CUSTOMER),
+    ]
+    assert as_relationship_repair(relationships, [[1, 2, 3]]) == {
+        "violating_path_indices": [],
+        "corrections": [],
+        "changes": 0,
+    }
+
+
+def test_as_repair_peer_patterns_need_no_change():
+    # up, peer, down is the canonical legal summit path.
+    relationships = [
+        ((1, 2), REL_LO_CUSTOMER),   # 1 customer of 2
+        ((2, 3), REL_PEER),
+        ((3, 4), REL_HI_CUSTOMER),   # 4 customer of 3
+    ]
+    assert as_relationship_repair(relationships, [[1, 2, 3, 4]]) == {
+        "violating_path_indices": [],
+        "corrections": [],
+        "changes": 0,
+    }
+    # A peer-only path and an all-peer path are legal too, but two peer hops
+    # in a three-AS path (which needs no c2p hop) is still one peer hop.
+    assert as_relationship_repair(
+        [((5, 6), REL_PEER)], [[5, 6]]
+    )["changes"] == 0
+
+
+def test_as_repair_two_peers_in_a_path_is_repaired():
+    # up, peer, peer would climb through two summits; a one-change repair
+    # exists on either peer edge.  The full new-relationship sequence over
+    # (1,2),(2,3),(3,4) chooses (0,0,2) over (0,2,1): turn the earlier peer
+    # (2,3) into a c2p link, giving up, up, peer.
+    relationships = [
+        ((1, 2), REL_LO_CUSTOMER),
+        ((2, 3), REL_PEER),
+        ((3, 4), REL_PEER),
+    ]
+    result = as_relationship_repair(relationships, [[1, 2, 3, 4]])
+    assert result["violating_path_indices"] == [0]
+    assert result["changes"] == 1
+    assert result["corrections"] == [
+        {"type": "customer_provider", "customer": 2, "provider": 3},
+    ]
+
+
+def test_as_repair_single_as_path_is_trivially_valid():
+    assert as_relationship_repair([], [[7]]) == {
+        "violating_path_indices": [],
+        "corrections": [],
+        "changes": 0,
+    }
+    assert as_relationship_repair([], []) == {
+        "violating_path_indices": [],
+        "corrections": [],
+        "changes": 0,
+    }
+
+
+def test_as_repair_violating_indices_follow_input_order():
+    # AS 2 has providers 1 and 3 and customer 4.
+    #   [3,2,1] up then up     -> legal (customer reaches its providers)
+    #   [4,2,3] down then down -> legal (provider reaches its customers)
+    #   [1,2,4] down then up   -> valley (violating)
+    relationships = [
+        ((1, 2), REL_HI_CUSTOMER),   # customer 2, provider 1
+        ((2, 3), REL_HI_CUSTOMER),   # customer 2, provider 3
+        ((2, 4), REL_LO_CUSTOMER),   # customer 2, provider 4
+    ]
+    paths = [[3, 2, 1], [4, 2, 3], [1, 2, 4]]
+    result = as_relationship_repair(relationships, paths)
+    assert result["violating_path_indices"] == [2]
+
+
+def test_as_repair_tie_break_prefers_smaller_pair_change():
+    # Valley 100->200->300 with both edges orientable either way at cost 1;
+    # the lexicographically smallest full new-relationship sequence changes
+    # the smaller pair (100,200) first.
+    relationships = [
+        ((100, 200), REL_HI_CUSTOMER),
+        ((200, 300), REL_LO_CUSTOMER),
+    ]
+    result = as_relationship_repair(relationships, [[100, 200, 300]])
+    assert result["corrections"] == [
+        {"type": "customer_provider", "customer": 100, "provider": 200},
+    ]
+    assert result["changes"] == 1
+
+
+def test_as_repair_tie_break_full_sequence_vs_changed_only():
+    # Path 6 -> 1 -> 5 is a peer hop followed by an up-hop (a summit after
+    # the first hop is illegal).  Two one-change repairs exist:
+    #   * flip the later (1,5) edge to customer 5/provider 1: path becomes
+    #     peer, down (changed sequence starts at (1,5));
+    #   * flip the earlier (1,6) edge to customer 6/provider 1: path becomes
+    #     up, up (changed sequence starts at (1,6)).
+    # A changed-only lexicographic comparison would pick the (1,5) flip
+    # (smaller changed pair), but the full sorted new-relationship sequence
+    # over (1,5),(1,6) is (1,0) for the (1,6) flip versus (0,1) for the
+    # (1,5) flip, so the (1,6) flip is the unique answer here.
+    relationships = [
+        ((1, 5), REL_LO_CUSTOMER),  # token 0
+        ((1, 6), REL_PEER),         # token 2
+    ]
+    paths = [[6, 1, 5]]
+    result = as_relationship_repair(relationships, paths)
+    assert result["changes"] == 1
+    assert result["corrections"] == [
+        {"type": "customer_provider", "customer": 6, "provider": 1},
+    ]
+
+
+def test_as_repair_unused_relationships_are_never_changed():
+    relationships = [
+        ((100, 200), REL_HI_CUSTOMER),
+        ((200, 300), REL_LO_CUSTOMER),
+        ((900, 901), REL_PEER),
+    ]
+    result = as_relationship_repair(relationships, [[100, 200, 300]])
+    # The unused (900,901) relationship neither constrains the search nor
+    # appears in the corrections.
+    assert all(
+        item["type"] == "customer_provider"
+        and {item["customer"], item["provider"]} != {900, 901}
+        for item in result["corrections"]
+    )
+    assert result["changes"] == len(result["corrections"]) == 1
+
+
+def test_as_repair_shared_edge_across_paths_uses_one_correction():
+    # Three paths share the (2,3) edge; whatever it becomes must satisfy all.
+    relationships = [
+        ((1, 2), REL_HI_CUSTOMER),
+        ((2, 3), REL_LO_CUSTOMER),
+        ((2, 4), REL_LO_CUSTOMER),
+    ]
+    paths = [[1, 2, 3], [4, 2, 3]]
+    result = as_relationship_repair(relationships, paths)
+    # One flip of the shared edge repairs both, never two corrections.
+    assert result["changes"] == 1
+    assert result["corrections"] == [
+        {"type": "customer_provider", "customer": 3, "provider": 2},
+    ]
+
+
+def test_as_repair_infeasible_returns_none():
+    # Four paths on five edges whose constraints contradict under every
+    # relabeling (any three of the paths are jointly satisfiable).
+    relationships = [
+        ((1, 2), REL_LO_CUSTOMER),
+        ((1, 3), REL_HI_CUSTOMER),
+        ((1, 4), REL_PEER),
+        ((2, 3), REL_LO_CUSTOMER),
+        ((3, 4), REL_HI_CUSTOMER),
+    ]
+    paths = [
+        [4, 3, 2, 1],
+        [2, 1, 3, 4],
+        [4, 1, 3, 2],
+        [3, 4, 1, 2],
+    ]
+    assert as_relationship_repair(relationships, paths) is None
+    # Every three-path subset is feasible, proving the witness is tight.
+    for keep in itertools.combinations(range(4), 3):
+        assert as_relationship_repair(
+            relationships, [paths[i] for i in keep]
+        ) is not None
+
+
+def _random_instance(rng, max_edges=9):
+    asns = list(range(1, rng.randint(3, 7)))
+    edge_pool = list(itertools.combinations(asns, 2))
+    rng.shuffle(edge_pool)
+    edges = sorted(edge_pool[: rng.randint(1, min(max_edges, len(edge_pool)))])
+    relationships = [(edge, rng.randint(0, 2)) for edge in edges]
+
+    adjacency = {}
+    for left, right in edges:
+        adjacency.setdefault(left, []).append(right)
+        adjacency.setdefault(right, []).append(left)
+
+    paths = []
+    for _ in range(rng.randint(1, AS_PATH_LIMIT)):
+        start = rng.choice(list(adjacency))
+        path = [start]
+        current = start
+        for _ in range(rng.randint(0, 4)):
+            options = [asn for asn in adjacency[current] if asn not in path]
+            if not options:
+                break
+            current = rng.choice(options)
+            path.append(current)
+        if len(path) >= 2:
+            paths.append(path)
+    if not paths:
+        paths.append([edges[0][0], edges[0][1]])
+    return relationships, paths
+
+
+def test_as_repair_matches_brute_force_on_random_instances():
+    rng = random.Random(20260927)
+    for _ in range(400):
+        relationships, paths = _random_instance(rng)
+        result = as_relationship_repair(relationships, paths)
+        expected = _brute_force_repair(relationships, paths)
+        if expected is None:
+            assert result is None
+            continue
+        assert result is not None
+        assert result["corrections"] == expected
+        assert result["changes"] == len(expected)
+
+
+def _brute_force_path_valid(path, tokens):
+    state = "U"
+    for left, right in zip(path, path[1:]):
+        kind = _hop_kind(
+            left, right, tokens[tuple(sorted((left, right)))]
+        )
+        if kind == "U":
+            if state != "U":
+                return False
+        elif kind == "P":
+            if state != "U":
+                return False
+            state = "P"
+        else:
+            state = "D"
+    return True
+
+
+def test_as_repair_violating_indices_match_grammar_on_random_instances():
+    rng = random.Random(987654321)
+    for _ in range(400):
+        relationships, paths = _random_instance(rng)
+        result = as_relationship_repair(relationships, paths)
+        original = dict(relationships)
+        expected = [
+            index
+            for index, path in enumerate(paths)
+            if not _brute_force_path_valid(path, original)
+        ]
+        # Violating indices are computed from the originals, independent of
+        # whether a repair exists (an infeasible instance still reports them).
+        if result is not None:
+            assert result["violating_path_indices"] == expected
+
+
+def test_as_repair_repaired_output_makes_every_path_valid_randomly():
+    rng = random.Random(13579)
+    for _ in range(400):
+        relationships, paths = _random_instance(rng)
+        result = as_relationship_repair(relationships, paths)
+        if result is None:
+            continue
+        tokens = dict(relationships)
+        for correction in result["corrections"]:
+            if correction["type"] == "peer":
+                pair = tuple(sorted(correction["peers"]))
+                tokens[pair] = REL_PEER
+            else:
+                pair = tuple(sorted(
+                    (correction["customer"], correction["provider"])
+                ))
+                tokens[pair] = as_relationship_token(
+                    correction["customer"], correction["provider"]
+                )
+        assert all(_brute_force_path_valid(path, tokens) for path in paths)
+
+
+def test_as_repair_respects_declared_limits():
+    assert AS_RELATIONSHIP_LIMIT == 9
+    assert AS_PATH_LIMIT == 20

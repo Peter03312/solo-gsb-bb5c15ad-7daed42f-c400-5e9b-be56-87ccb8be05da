@@ -20,7 +20,9 @@ in-addr.arpa NS records for a /24, RFC 2317 range-label subzones plus
 per-address parent-zone CNAMEs for /25 through /32) and ``roa_coverage``
 (RFC 6483 RPKI ROA valid/invalid/unknown coverage map for every aligned
 candidate route of one prefix length inside one scope, returned as a
-minimal non-overlapping CIDR status partition).
+minimal non-overlapping CIDR status partition), and ``as_relationship_repair``
+(minimum-cardinality repair of undirected AS customer-provider/peer
+relationships so every supplied AS path becomes valley-free).
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import re
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple, TypeAlias, Union
@@ -1673,4 +1676,177 @@ def roa_coverage(
             {"cidr": str(network), "status": status}
             for network, status in pieces
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# as-relationship-repair: minimum-cardinality repair of undirected AS
+# customer-provider/peer relationships so every given origin-to-receiver AS
+# path satisfies the valley-free rule (zero or more up-hops, at most one peer
+# hop, then zero or more down-hops).
+# ---------------------------------------------------------------------------
+
+#: Maximum number of undirected AS relationships accepted.
+AS_RELATIONSHIP_LIMIT = 9
+
+#: Maximum number of AS paths accepted.
+AS_PATH_LIMIT = 20
+
+#: Inclusive 32-bit AS number range (same bounds as the ROA endpoints).
+ASN_MIN = 0
+ASN_MAX = 4294967295
+
+#: New-relationship code on a canonical pair ``(lo, hi)`` used as the
+#: deterministic component of the equal-cost lexicographic tie-break:
+#: ``lo`` is the customer (``lo`` -> ``hi`` up-hill), then ``hi`` is the
+#: customer (``hi`` -> ``lo`` up-hill), then a peer relationship.
+REL_LO_CUSTOMER = 0
+REL_HI_CUSTOMER = 1
+REL_PEER = 2
+RELATIONSHIP_CODES: tuple[int, int, int] = (
+    REL_LO_CUSTOMER,
+    REL_HI_CUSTOMER,
+    REL_PEER,
+)
+
+
+def as_relationship_token(customer: int, provider: int) -> int:
+    """Return the canonical new-relationship code for one c2p orientation.
+
+    The code of an undirected pair ``(lo, hi)`` (``lo < hi``) is
+    :data:`REL_LO_CUSTOMER` when ``lo`` is the customer and
+    :data:`REL_HI_CUSTOMER` when ``hi`` is the customer.  Peer relationships
+    always carry :data:`REL_PEER`.
+    """
+    lo, hi = sorted((customer, provider))
+    return REL_LO_CUSTOMER if customer == lo else REL_HI_CUSTOMER
+
+
+def _hop_kind(left: int, right: int, token: int) -> str:
+    """Classify one traversed hop ``left -> right`` as ``U``, ``D`` or ``P``.
+
+    ``U`` (up-hill) and ``D`` (down-hill) are the two orientations of a
+    customer-provider relationship: a customer walking to its provider goes up,
+    a provider walking to its customer goes down; a peer hop is ``P`` in
+    either direction.  ``token`` follows :data:`RELATIONSHIP_CODES` on the
+    canonical pair of ``left``/``right``.
+    """
+    if token == REL_PEER:
+        return "P"
+    lo, hi = sorted((left, right))
+    customer = lo if token == REL_LO_CUSTOMER else hi
+    return "U" if left == customer else "D"
+
+
+def _path_is_valley_free(
+    path: Sequence[int], tokens: dict[tuple[int, int], int]
+) -> bool:
+    """Whether one origin-to-receiver path matches ``up* peer? down*``.
+
+    The state is the most permissive hop class still legal: ``U`` while only
+    up-hops (and none after) have been seen, ``P`` after the single peer hop,
+    ``D`` after the first down-hop.  An up-hop after a peer/down-hop, or a
+    second peer hop, forms a valley (or a second summit) and fails the path.
+    """
+    state = "U"
+    for left, right in zip(path, path[1:]):
+        pair = (left, right) if left < right else (right, left)
+        kind = _hop_kind(left, right, tokens[pair])
+        if kind == "U":
+            if state != "U":
+                return False
+        elif kind == "P":
+            if state != "U":
+                return False
+            state = "P"
+        else:  # down-hop: legal from every non-final state, then stay in "D"
+            state = "D"
+    return True
+
+
+def _relationship_record(pair: tuple[int, int], token: int) -> dict:
+    """Serialize one repaired relationship in the request/response shape."""
+    lo, hi = pair
+    if token == REL_PEER:
+        return {"type": "peer", "peers": [lo, hi]}
+    if token == REL_LO_CUSTOMER:
+        return {"type": "customer_provider", "customer": lo, "provider": hi}
+    return {"type": "customer_provider", "customer": hi, "provider": lo}
+
+
+def as_relationship_repair(
+    relationships: Sequence[tuple[tuple[int, int], int]],
+    paths: Sequence[Sequence[int]],
+) -> dict | None:
+    """Repair AS relationships so every path is simultaneously valley-free.
+
+    ``relationships`` maps every undirected pair that may be used (as
+    ``((lo, hi), token)`` with ``lo < hi`` and a token from
+    :data:`RELATIONSHIP_CODES`) to its original relationship.  ``paths`` are
+    origin-to-receiver AS sequences; the caller (Pydantic schema) guarantees
+    the bounds, unique ASNs inside each path and that every hop pair exists in
+    ``relationships``.
+
+    Every used pair may keep its token or take one of the other two
+    relationships (the reverse customer-provider orientation or a peer).  The
+    repair minimizes the number of changed pairs; pairs unused by any path are
+    never changed.  Among equal-cost repairs the lexicographically smallest
+    token sequence over the used pairs in canonical ``(lo, hi)`` order — the
+    sorted new-relationship sequence — uniquely wins.  Returns ``None`` when
+    no relationship assignment makes every path valley-free (HTTP 409).
+
+    The result lists the indices of paths that were already violating under
+    the original relationships, every changed pair (sorted by canonical pair)
+    with its new relationship, and the change count.  With at most
+    :data:`AS_RELATIONSHIP_LIMIT` used pairs the exhaustive search visits at
+    most :math:`3^9 = 19683` assignments.
+    """
+    original = {pair: token for pair, token in relationships}
+    used_pairs = sorted({
+        pair
+        for path in paths
+        for left, right in zip(path, path[1:])
+        for pair in ((left, right) if left < right else (right, left),)
+    })
+
+    original_tokens = {pair: original[pair] for pair in used_pairs}
+    violating_indices = [
+        index
+        for index, path in enumerate(paths)
+        if not _path_is_valley_free(path, original_tokens)
+    ]
+
+    # Iterate tokens pair-by-pair in canonical order; itertools.product emits
+    # tuples lexicographically, so ties are resolved by the full sorted
+    # new-relationship sequence without a second comparison pass.
+    best_combo: tuple[int, ...] | None = None
+    best_cost = len(used_pairs) + 1
+    for combo in itertools.product(
+        RELATIONSHIP_CODES, repeat=len(used_pairs)
+    ):
+        tokens = dict(zip(used_pairs, combo))
+        if not all(_path_is_valley_free(path, tokens) for path in paths):
+            continue
+        cost = sum(
+            token != original_tokens[pair]
+            for pair, token in zip(used_pairs, combo)
+        )
+        # Minimum cardinality first; at equal cost the first visited combo is
+        # already the lexicographically smallest new-relationship sequence.
+        if cost < best_cost:
+            best_cost = cost
+            best_combo = combo
+
+    if best_combo is None:
+        return None
+
+    corrections = [
+        _relationship_record(pair, token)
+        for pair, token in zip(used_pairs, best_combo)
+        if token != original_tokens[pair]
+    ]
+    return {
+        "violating_path_indices": violating_indices,
+        "corrections": corrections,
+        "changes": best_cost,
     }
