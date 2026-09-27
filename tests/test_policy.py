@@ -2230,3 +2230,260 @@ def test_roa_random_shorter_length_cases_return_empty():
         ))
         length = rng.randint(0, scope_len - 1)
         assert roa_coverage(str(scope), 1, length, []) == {"partitions": []}
+
+
+# ---------------------------------------------------------------------------
+# as-relationship-repair: minimum-change, lexicographically-unique repair of
+# undirected AS relationships so every AS path is valley-free
+# (uphill* peer? downhill*).
+# ---------------------------------------------------------------------------
+
+from itertools import product as _product
+
+from app.policy import (
+    AS_RELATION_STATES,
+    AS_STATE_TOKEN,
+    as_pair,
+    as_relationship_repair,
+    canonical_relation,
+    is_valley_free,
+    path_hop_sequence,
+    relation_state,
+    validate_as_batch,
+)
+
+
+def _c2p(customer, provider):
+    return {"type": "c2p", "customer": customer, "provider": provider}
+
+
+def _p2p(a, b):
+    return {"type": "p2p", "endpoints": [a, b]}
+
+
+def _canon(entries):
+    return [canonical_relation(entry) for entry in entries]
+
+
+def _brute_force_repair(relations, paths):
+    """Reference oracle: enumerate all 3^R joint assignments directly."""
+    pairs = sorted((lo, hi) for lo, hi, _ in relations)
+    original = {
+        (lo, hi): relation_state(lo, hi, kind) for lo, hi, kind in relations
+    }
+    violating = [
+        i for i, path in enumerate(paths)
+        if not is_valley_free(path_hop_sequence(path, original))
+    ]
+    best = None
+    for combo in _product(AS_RELATION_STATES, repeat=len(pairs)):
+        states = dict(zip(pairs, combo))
+        if not all(
+            is_valley_free(path_hop_sequence(path, states)) for path in paths
+        ):
+            continue
+        changed = [p for p in pairs if states[p] != original[p]]
+        key = (len(changed), tuple(
+            (lo, hi, AS_STATE_TOKEN[states[(lo, hi)]]) for lo, hi in changed
+        ))
+        if best is None or key < best:
+            best = key
+    return violating, best
+
+
+def test_canonical_relation_orders_the_pair_and_keeps_orientation():
+    assert canonical_relation(_c2p(1, 3)) == (1, 3, "c2p")
+    assert canonical_relation(_c2p(3, 1)) == (1, 3, "p2c")
+    assert canonical_relation(_p2p(3, 1)) == (1, 3, "p2p")
+    assert canonical_relation(_p2p(1, 3)) == (1, 3, "p2p")
+
+
+def test_valley_free_shapes():
+    assert is_valley_free("UU")
+    assert is_valley_free("DD")
+    assert is_valley_free("UUD")
+    assert is_valley_free("UPD")
+    assert is_valley_free("P")
+    assert is_valley_free("UP")
+    assert is_valley_free("PD")
+    assert not is_valley_free("DU")
+    assert not is_valley_free("UDU")
+    assert not is_valley_free("UPU")
+    assert not is_valley_free("PDDU")
+    assert not is_valley_free("PP")
+    assert not is_valley_free("DP")
+    assert not is_valley_free("PUP")
+
+
+def test_repair_noop_when_all_paths_compliant():
+    relations = _canon([_c2p(1, 2), _c2p(2, 3)])
+    assert as_relationship_repair(relations, [[1, 2, 3]]) == {
+        "violating_paths": [], "repairs": [], "change_count": 0,
+    }
+    relations = _canon([_c2p(1, 2), _p2p(2, 3), _c2p(4, 3)])
+    assert as_relationship_repair(relations, [[1, 2, 3, 4]])[
+        "violating_paths"] == []
+
+
+def test_repair_single_reversed_c2p_hop():
+    relations = _canon([_c2p(2, 1), _c2p(2, 3)])
+    assert as_relationship_repair(relations, [[1, 2, 3]]) == {
+        "violating_paths": [0],
+        "repairs": [_c2p(1, 2)],
+        "change_count": 1,
+    }
+
+
+def test_repair_two_peer_hops_takes_one_change_with_lex_token():
+    # P P is illegal; making the first pair c2p (1 customer of 2) yields U P,
+    # the lexicographically smallest one-change new-relation sequence.
+    relations = _canon([_p2p(1, 2), _p2p(2, 3)])
+    result = as_relationship_repair(relations, [[1, 2, 3]])
+    assert result == {
+        "violating_paths": [0],
+        "repairs": [_c2p(1, 2)],
+        "change_count": 1,
+    }
+
+
+def test_repair_lex_tie_breaks_to_smaller_as_pair():
+    # Path 4-1-3-2 is a U-D-U valley; flipping either pair (1,3) or (2,3)
+    # repairs it with one change, so the sorted smaller pair (1,3) wins.
+    relations = _canon([_c2p(4, 1), _c2p(3, 1), _c2p(3, 2)])
+    assert as_relationship_repair(relations, [[4, 1, 3, 2]]) == {
+        "violating_paths": [0],
+        "repairs": [_c2p(1, 3)],
+        "change_count": 1,
+    }
+
+
+def test_repair_shared_relationship_fixes_multiple_paths_at_once():
+    # Both paths valley through the shared pair (2,3); flipping just that
+    # pair is the unique one-change fix for both, so change_count is 1
+    # rather than one repair per path.
+    relations = _canon([
+        _c2p(1, 2), _c2p(3, 2), _c2p(3, 4), _p2p(5, 3), _c2p(6, 2),
+    ])
+    paths = [[1, 2, 3, 4], [5, 3, 2, 6]]
+    assert as_relationship_repair(relations, paths) == {
+        "violating_paths": [0, 1],
+        "repairs": [_c2p(2, 3)],
+        "change_count": 1,
+    }
+
+
+def test_repair_violating_indices_skip_compliant_paths():
+    relations = _canon([_c2p(1, 2), _c2p(3, 2), _c2p(3, 4)])
+    # [1,2,3,4] is U-D-U (valley); [2,3] is a legal single downhill hop.
+    result = as_relationship_repair(relations, [[1, 2, 3, 4], [2, 3]])
+    assert result["violating_paths"] == [0]
+    assert result["change_count"] == 1
+    assert result["repairs"] == [_c2p(2, 3)]
+
+
+def test_repair_infeasible_k4_witness_returns_none():
+    # K4 fully meshed: the eight ordered two-hop paths through ASes 1-4 rule
+    # out every joint c2p/p2c/p2p assignment (an orientation cycle plus
+    # directions no peer can satisfy).
+    pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
+    relations = _canon([_p2p(a, b) for a, b in pairs])
+    witness = [
+        [2, 1, 3], [2, 1, 4], [3, 1, 4],
+        [1, 2, 3], [1, 2, 4], [3, 2, 4],
+        [1, 3, 2], [1, 4, 2],
+    ]
+    assert as_relationship_repair(relations, witness) is None
+
+
+def test_repair_random_cases_match_brute_force_oracle():
+    rng = random.Random(20240927)
+    for _ in range(150):
+        node_count = rng.randint(3, 6)
+        nodes = list(range(1, node_count + 1))
+        edge_count = rng.randint(1, min(6, node_count * (node_count - 1) // 2))
+        edges = rng.sample(
+            [(a, b) for a in nodes for b in nodes if a < b], edge_count
+        )
+        entries = []
+        for a, b in edges:
+            choice = rng.randrange(3)
+            if choice == 0:
+                entries.append(_c2p(a, b))
+            elif choice == 1:
+                entries.append(_c2p(b, a))
+            else:
+                entries.append(_p2p(a, b))
+        relations = _canon(entries)
+        adjacency = {}
+        for a, b in edges:
+            adjacency.setdefault(a, []).append(b)
+            adjacency.setdefault(b, []).append(a)
+
+        paths = []
+        for _ in range(rng.randint(0, 8)):
+            starts = [n for n in nodes if n in adjacency]
+            if not starts:
+                break
+            path = [rng.choice(starts)]
+            for _ in range(rng.randint(1, node_count - 1)):
+                options = [z for z in adjacency[path[-1]] if z not in path]
+                if not options:
+                    break
+                path.append(rng.choice(options))
+            if len(path) >= 2:
+                paths.append(path)
+
+        result = as_relationship_repair(relations, paths)
+        violating, best = _brute_force_repair(relations, paths)
+        assert result is not None or best is None
+        if best is None:
+            continue
+        cost, key = best
+        assert result["violating_paths"] == violating
+        assert result["change_count"] == cost
+        expected_repairs = []
+        for lo, hi, token in key:
+            if token == "c2p":
+                expected_repairs.append(_c2p(lo, hi))
+            elif token == "p2c":
+                expected_repairs.append(_c2p(hi, lo))
+            else:
+                expected_repairs.append(_p2p(lo, hi))
+        assert result["repairs"] == expected_repairs
+
+
+def test_as_batch_validation_errors():
+    with pytest.raises(ValueError, match="limit of 9"):
+        validate_as_batch(
+            _canon([_c2p(1, 2)] * 10), [],
+        )
+    with pytest.raises(ValueError, match="limit of 20"):
+        validate_as_batch([], [[1, 2]] * 21)
+    with pytest.raises(ValueError, match="at least two ASes"):
+        validate_as_batch(_canon([_c2p(1, 2)]), [[1]])
+    with pytest.raises(ValueError, match="repeats an AS"):
+        validate_as_batch(_canon([_c2p(1, 2)]), [[1, 2, 1]])
+    with pytest.raises(ValueError, match="without a listed relationship"):
+        validate_as_batch(_canon([_c2p(1, 2)]), [[1, 2, 3]])
+    with pytest.raises(ValueError, match="duplicate relationship"):
+        validate_as_batch(_canon([_c2p(1, 2), _c2p(2, 1)]), [])
+
+
+def test_canonical_relation_validation_errors():
+    with pytest.raises(ValueError, match="integer"):
+        canonical_relation({"type": "c2p", "customer": "1", "provider": 2})
+    with pytest.raises(ValueError, match="integer"):
+        canonical_relation({"type": "c2p", "customer": True, "provider": 2})
+    with pytest.raises(ValueError, match="32-bit"):
+        canonical_relation({"type": "c2p", "customer": 2 ** 32, "provider": 2})
+    with pytest.raises(ValueError, match="distinct"):
+        canonical_relation(_c2p(5, 5))
+    with pytest.raises(ValueError, match="distinct"):
+        canonical_relation(_p2p(5, 5))
+    with pytest.raises(ValueError, match="exactly two"):
+        canonical_relation({"type": "p2p", "endpoints": [1]})
+    with pytest.raises(ValueError, match="'c2p' or 'p2p'"):
+        canonical_relation({"type": "sibling"})
+    with pytest.raises(ValueError, match="object"):
+        canonical_relation("not-a-dict")
+    assert as_pair(3, 1) == (1, 3)

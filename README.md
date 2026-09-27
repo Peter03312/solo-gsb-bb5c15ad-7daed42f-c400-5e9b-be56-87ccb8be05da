@@ -7,8 +7,9 @@
 另提供地址判定（`/evaluate`）、策略对比（`/compare`）、规则影响审计
 （`/audit-rules`）、策略最小化（`/minimize-policy`）、子网分配
 （`/allocate`）、地址/网段密钥脱敏（`/anonymize`）、同一 `/24` 内
-IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）以及单个 scope 内
-拟发布路由的 RPKI ROA 覆盖状态分区（`/roa-coverage`）接口。
+IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）、单个 scope 内
+拟发布路由的 RPKI ROA 覆盖状态分区（`/roa-coverage`）以及无向 AS 关系的
+无谷合规修复（`/as-relationship-repair`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -33,6 +34,13 @@ IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）以及单个 sc
   状态，并输出**按网络地址排序、互不重叠的最小 CIDR 状态分区**（分区可短于
   拟发布前缀长度）；全程只沿 ROA 边界做前缀树切分，**不逐个枚举候选子网**，
   可直接处理 `::/0`、候选为 `/128` 的超大 IPv6 范围；
+- `/as-relationship-repair` 接收至多 9 条无向 AS 关系（客户-提供商需指明
+  customer/provider，对等只给两个端点）及至多 20 条按**起源→接收者**排列的
+  AS 路径，校验路径无重复 AS 且每跳都有关系（否则 422），按 **上行\*、至多
+  一次对等、下行\*** 的**无谷规则**判定每条路径，以**改动关系条数最少**为目标
+  精确搜索使全部路径同时合规的修正（同一关系在各路径间共用同一份结果），
+  同分按 AS 对排序后的新关系序列字典序取唯一方案，返回改动前的违规路径下标、
+  修正关系与改动条数；不存在可行修正时返回 **HTTP 409**；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
 ## 一条命令启动
@@ -43,7 +51,17 @@ IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）以及单个 sc
 docker compose up -d --build
 ```
 
-服务监听宿主机 **8000** 端口（容器内固定 8000）。
+服务监听宿主机 **8000** 端口（容器内固定 8000），所有接口前缀均为
+`http://localhost:8000`，例如：
+
+```bash
+curl http://localhost:8000/health                      # 健康检查
+curl http://localhost:8000/openapi.json                # OpenAPI 模式
+# 新接口示例：
+curl -X POST http://localhost:8000/as-relationship-repair \
+  -H 'Content-Type: application/json' \
+  -d '{"relationships":[{"type":"p2p","endpoints":[1,2]}],"paths":[[1,2]]}'
+```
 
 健康检查：
 
@@ -842,6 +860,123 @@ curl -s -X POST http://localhost:8000/roa-coverage \
   （含裸地址、主机位非零）、ROA `asn` 越界或 `max_length` 不在
   「ROA 前缀长度～地址族上限」区间内，统一返回 **HTTP 422**。
 
+### `POST /as-relationship-repair`
+
+接收一个小型无向 AS 关系拓扑（**至多 9 条关系**）与一组按**起源 AS →
+接收 AS**排列的 AS 路径（**至多 20 条**），判定并修复路径的 **无谷
+（valley-free）合规性**。
+
+关系只有两类：
+
+- **客户-提供商（c2p）**：必须显式给出 `customer` 与 `provider`（有方向）；
+- **对等（p2p）**：只需给出 `endpoints` 两个 AS（无方向，顺序随意）。
+
+每条路径沿起源到接收者的方向逐跳分类：客户→提供商为**上行（U）**、
+提供商→客户为**下行（D）**、对等为**对等跳（P）**。无谷规则要求整条路径形如：
+
+```
+上行*  对等跳?  下行*
+```
+
+即可以只上行、只下行、先上后下，或在山顶处经过至多一次对等；**下行之后再上行
+（或再经过对等）就是“山谷”，属于违规路径**；一条路径中出现两次对等跳同样违规。
+
+允许把**一条关系改成另一种客户-提供商方向或改成对等关系**（三种状态任选），
+修复目标是：
+
+1. 让**全部路径同时合规**，且**改动的关系条数最少**；
+2. **同一条关系在所有路径中共用同一份修正结果**（不按路径分别改）；
+3. 若存在多组同样最少的方案，按 **AS 对排序后“新关系序列”的字典序**取唯一方案
+   （AS 对按两个 AS 号升序排列；同一对的新类型文本序为
+   `c2p` < `p2c` < `p2p`，而客户-提供商方向由 `customer`/`provider` 字段表达）。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| `relationships` | `object[]` | 无向 AS 关系列表，可省略（默认 `[]`），**至多 9 条**；同一 AS 对只能出现一次 |
+| `relationships[].type` | `string` | `"c2p"`（客户-提供商）或 `"p2p"`（对等） |
+| `relationships[].customer` / `provider` | `int` | `type == "c2p"` 时必填，32 位 AS 号（0～4294967295），二者不得相同 |
+| `relationships[].endpoints` | `int[2]` | `type == "p2p"` 时必填，恰好两个互不相同的 32 位 AS 号 |
+| `paths` | `int[][]` | AS 路径列表，可省略（默认 `[]`），**至多 20 条**；每条按起源→接收者排列，至少 2 个 AS、无重复 AS，且每对相邻 AS 都必须在 `relationships` 中有关系 |
+
+输入合法性（关系数/路径数超限、AS 号越界、同一对重复关系、路径少于 2 个 AS 或
+出现重复 AS、某跳没有对应关系、对等端点不是两个等）任一不满足，整批返回
+**HTTP 422**。
+
+示例：路径 `4-1-3-2` 的逐跳为 **上-下-上**（山谷）。把关系 `1/3` 反转为
+「AS1 是 AS3 的客户」即可得到 **上-上-下**；反转 `2/3` 也能以同样 1 条改动
+修复，按 AS 对字典序取较小的 `1/3`：
+
+```bash
+curl -s -X POST http://localhost:8000/as-relationship-repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "relationships": [
+          {"type": "c2p", "customer": 4, "provider": 1},
+          {"type": "c2p", "customer": 3, "provider": 1},
+          {"type": "c2p", "customer": 3, "provider": 2}
+        ],
+        "paths": [[4, 1, 3, 2]]
+      }'
+```
+
+响应：
+
+```json
+{
+  "violating_paths": [0],
+  "repairs": [
+    {"type": "c2p", "customer": 1, "provider": 3}
+  ],
+  "change_count": 1
+}
+```
+
+字段说明：
+
+- `violating_paths`：**改动前**违反无谷规则的路径在 `paths` 中的 **0 基下标**
+  （升序）；全部本就合规时为 `[]`；
+- `repairs`：需要改动的关系修正后的完整定义，按 **AS 对（较小 AS 号在前）
+  排序**；本就正确的关系不出现。c2p 条目的方向由修正后的
+  `customer`/`provider` 表达，p2p 条目给出 `endpoints`。该修正对引用此关系的
+  所有路径同时生效；
+- `change_count`：改动条数，即所有可行方案中的最小值；为 `0` 时 `repairs`
+  为空数组。
+
+全部路径本来就合规时，即使携带关系与路径也返回
+`{"violating_paths": [], "repairs": [], "change_count": 0}`；空请求体 `{}`
+同样合法。
+
+无可行方案时返回 **409**（不返回任何部分修正）。下例中 AS1～AS4 两两全连接
+（6 条对等关系），8 条二跳路径共同排除了所有 $3^6$ 种关系状态组合：
+
+```bash
+curl -i -X POST http://localhost:8000/as-relationship-repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "relationships": [
+          {"type": "p2p", "endpoints": [1, 2]},
+          {"type": "p2p", "endpoints": [1, 3]},
+          {"type": "p2p", "endpoints": [1, 4]},
+          {"type": "p2p", "endpoints": [2, 3]},
+          {"type": "p2p", "endpoints": [2, 4]},
+          {"type": "p2p", "endpoints": [3, 4]}
+        ],
+        "paths": [
+          [2, 1, 3], [2, 1, 4], [3, 1, 4],
+          [1, 2, 3], [1, 2, 4], [3, 2, 4],
+          [1, 3, 2], [1, 4, 2]
+        ]
+      }'
+# HTTP/1.1 409 Conflict
+# {"detail":"no assignment of the listed relationships makes every
+#   path valley-free; no partial repair returned"}
+```
+
+非法或冲突输入（超限、AS 号越界、同对重复关系、路径成环/单点、某跳无关系等）
+统一返回 **HTTP 422**。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -971,6 +1106,30 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
    **最小 CIDR 状态分区**（可短于拟发布长度 `/L`）。核心实现另有基于逐候选
    暴力判定（RFC 6483）的 IPv4/IPv6 随机对拍测试校验分区的正确性与最小性。
 
+`/as-relationship-repair` 是一个对**每对 AS 三种关系状态**的**精确穷举搜索**
+（`app/policy.py` 中 `as_relationship_repair` / `is_valley_free` /
+`path_hop_sequence`）：
+
+1. 输入先做两层校验：单条关系校验 AS 号为 32 位无符号整数（拒绝布尔等非整数）、
+   c2p 两端不同、p2p 恰有两个不同端点，并把每条关系规范化为
+   `(min(AS), max(AS), 方向标记)`；整批校验关系数 ≤ 9、路径数 ≤ 20、同一 AS 对
+   不得重复、每条路径至少 2 个 AS 且无重复 AS、每对相邻 AS 都有关系。任一失败
+   均经 Pydantic 校验器转成 **HTTP 422**；
+2. 每条无向关系有且仅有三种状态：小号 AS 是大号 AS 的客户、小号是大号的提供商、
+   对等。给定联合状态后，每条路径按行进方向把每跳记为 `U`/`D`/`P`，当且仅当
+   跳序列匹配 `U* P? D*`（等价于：至多一个 `P`，且去掉 `P` 后不存在 `D` 紧接
+   `U`，`P` 两侧分别只能有 `U` 与 `D`）时合规；
+3. 因关系数 ≤ 9，联合状态至多 $3^9 = 19683$ 种，直接全部枚举：保留使**每条**
+   路径都合规的状态，统计其中与原始状态不同的关系数，取**改动条数最少**者；
+   同分时比较「按 AS 对排序后的 `(小号, 大号, 新关系记号)` 序列」的字典序
+   （记号文本序 `c2p` < `p2c` < `p2p`），因此最优方案**唯一**。同一对关系只
+   枚举一次，修正天然在所有路径间共享；
+4. 响应的 `violating_paths` 在**原始**关系状态下另行计算（与修复结果无关）；
+   所有联合状态都无法让全部路径合规时返回 `None`，由路由层转为 **HTTP 409**。
+   测试中另有对随机小拓扑逐枚举 $3^{|R|}$ 状态的独立参考实现对拍，校验最少改动
+   数、字典序决胜与违规下标三者完全一致，并含一个 4 AS 全连接、8 条二跳路径的
+   固定无解（409）用例。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -995,12 +1154,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区（仅 ipaddress + hmac/hashlib）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage、/as-relationship-repair
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区、AS 关系无谷修复穷举搜索（仅 ipaddress + hmac/hashlib）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质）
-│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝/OpenAPI 文档）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质、/as-relationship-repair 与 3^|R| 暴力参考实现对拍及固定 409 用例）
+│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝/OpenAPI 文档、/as-relationship-repair 最少改动/字典序决胜/409/422/OpenAPI 文档）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

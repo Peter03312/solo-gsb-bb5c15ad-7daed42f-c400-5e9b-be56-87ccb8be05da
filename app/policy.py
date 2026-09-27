@@ -20,7 +20,11 @@ in-addr.arpa NS records for a /24, RFC 2317 range-label subzones plus
 per-address parent-zone CNAMEs for /25 through /32) and ``roa_coverage``
 (RFC 6483 RPKI ROA valid/invalid/unknown coverage map for every aligned
 candidate route of one prefix length inside one scope, returned as a
-minimal non-overlapping CIDR status partition).
+minimal non-overlapping CIDR status partition).  It also hosts
+``as_relationship_repair`` (minimum-change repair of undirected AS
+customer/provider/peer relationships so every given AS path is
+valley-free: zero or more uphill hops, at most one peer hop, then zero or
+more downhill hops).
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import hmac
 import ipaddress
 import re
 from collections.abc import Iterable, Sequence
+from itertools import product
 from typing import NamedTuple, TypeAlias, Union
 
 Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -1673,4 +1678,315 @@ def roa_coverage(
             {"cidr": str(network), "status": status}
             for network, status in pieces
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# as-relationship-repair: minimum-change repair of undirected AS relationships
+# so that every given origin-to-receiver AS path obeys the valley-free rule:
+# uphill* (customer->provider), at most one peer hop, then downhill*
+# (provider->customer).  With at most 9 relationships there are at most
+# 3**9 = 19683 joint states (three rel types per undirected pair), which an
+# exact exhaustive search covers directly; ties are broken lexicographically
+# by the sorted AS-pair sequence of the new relationships.
+# ---------------------------------------------------------------------------
+
+#: Maximum number of undirected AS relationships accepted per request.
+AS_RELATION_LIMIT = 9
+
+#: Maximum number of AS paths accepted per request.
+AS_PATH_LIMIT = 20
+
+#: Maximum valid 32-bit AS number (AS 0 is syntactically accepted, matching
+#: the /roa-coverage ASN range).
+MAX_ASN = 4294967295
+
+# State of one undirected AS pair, keyed by ``(min(asn), max(asn))``:
+#   0 - the smaller ASN is the customer of the larger ASN;
+#   1 - the smaller ASN is the provider of the larger ASN;
+#   2 - the pair peers.
+# The integer order doubles as the per-pair enumeration order below; the
+# lexicographic tie-break uses the textual tokens instead (see
+# :data:`AS_RELATION_STATES`).
+AS_STATE_C2P_LOW_CUSTOMER = 0
+AS_STATE_C2P_LOW_PROVIDER = 1
+AS_STATE_PEER = 2
+
+#: Enumeration order of the three legal states per AS pair.
+AS_RELATION_STATES: tuple[int, ...] = (
+    AS_STATE_C2P_LOW_CUSTOMER,
+    AS_STATE_C2P_LOW_PROVIDER,
+    AS_STATE_PEER,
+)
+
+#: Textual token per state, used in the response and the tie-break key.
+AS_STATE_TOKEN: dict[int, str] = {
+    AS_STATE_C2P_LOW_CUSTOMER: "c2p",
+    AS_STATE_C2P_LOW_PROVIDER: "p2c",
+    AS_STATE_PEER: "p2p",
+}
+
+#: Hop character per traversal direction: uphill (customer -> provider),
+#: peer, and downhill (provider -> customer).
+_HOP_UP = "U"
+_HOP_PEER = "P"
+_HOP_DOWN = "D"
+
+
+def parse_asn(value: object) -> int:
+    """Validate one AS number and return it as an ``int``.
+
+    Booleans are rejected (they are ``int`` instances in Python but are not
+    AS numbers), as are values outside the unsigned 32-bit range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"AS number must be an integer, got {type(value).__name__}")
+    if not 0 <= value <= MAX_ASN:
+        raise ValueError(
+            f"AS number {value} is outside the unsigned 32-bit range "
+            f"[0, {MAX_ASN}]"
+        )
+    return value
+
+
+def as_pair(a: int, b: int) -> tuple[int, int]:
+    """Canonical undirected AS pair key ``(min(a, b), max(a, b))``."""
+    return (a, b) if a <= b else (b, a)
+
+
+def canonical_relation(entry: object) -> tuple[int, int, str]:
+    """Validate one relationship object into the canonical ``(lo, hi, kind)``.
+
+    A customer/provider entry has ``kind == "c2p"`` and integer ``customer``
+    and ``provider`` fields; a peer entry has ``kind == "p2p"`` and a
+    two-element, endpoint-distinct ``endpoints`` list.  The returned ``lo``/
+    ``hi`` order the two AS numbers; ``kind`` keeps the input orientation for
+    c2p and is ``"p2p"`` for peers.  Malformed input raises
+    :class:`ValueError`.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"relationship must be an object, got {type(entry).__name__}"
+        )
+    kind = entry.get("type")
+    if kind == "c2p":
+        customer = parse_asn(entry.get("customer"))
+        provider = parse_asn(entry.get("provider"))
+        if customer == provider:
+            raise ValueError(
+                f"customer/provider relationship must link two distinct ASes, "
+                f"got AS {customer} on both sides"
+            )
+        lo, hi = as_pair(customer, provider)
+        return (lo, hi, "c2p" if lo == customer else "p2c")
+    if kind == "p2p":
+        endpoints = entry.get("endpoints")
+        if not isinstance(endpoints, (list, tuple)) or len(endpoints) != 2:
+            raise ValueError(
+                "peer relationship must list exactly two endpoints"
+            )
+        first = parse_asn(endpoints[0])
+        second = parse_asn(endpoints[1])
+        if first == second:
+            raise ValueError(
+                f"peer relationship must link two distinct ASes, got AS "
+                f"{first} on both sides"
+            )
+        lo, hi = as_pair(first, second)
+        return (lo, hi, "p2p")
+    raise ValueError(
+        f"relationship type must be 'c2p' or 'p2p', got {kind!r}"
+    )
+
+
+def relation_state(lo: int, hi: int, kind: str) -> int:
+    """Map a canonical ``(lo, hi, kind)`` tuple onto its state integer."""
+    if kind == "c2p":
+        # lo is the customer of hi.
+        return AS_STATE_C2P_LOW_CUSTOMER
+    if kind == "p2c":
+        # lo is the provider of hi.
+        return AS_STATE_C2P_LOW_PROVIDER
+    return AS_STATE_PEER
+
+
+def validate_as_batch(
+    relations: Sequence[tuple[int, int, str]],
+    paths: Sequence[Sequence[int]],
+) -> None:
+    """Apply the cross-entry batch checks for :func:`as_relationship_repair`.
+
+    The relationship list may not exceed :data:`AS_RELATION_LIMIT`, the path
+    list may not exceed :data:`AS_PATH_LIMIT`, no relationship may be given
+    twice for one AS pair, every path must hold at least two distinct ASes in
+    its given origin-to-receiver order (no repeated AS), and each consecutive
+    pair on every path must have a listed relationship.  Any violation raises
+    :class:`ValueError`.
+    """
+    if len(relations) > AS_RELATION_LIMIT:
+        raise ValueError(
+            f"number of relationships ({len(relations)}) exceeds the limit of "
+            f"{AS_RELATION_LIMIT}"
+        )
+    if len(paths) > AS_PATH_LIMIT:
+        raise ValueError(
+            f"number of paths ({len(paths)}) exceeds the limit of "
+            f"{AS_PATH_LIMIT}"
+        )
+    seen_pairs: set[tuple[int, int]] = set()
+    for lo, hi, _kind in relations:
+        if (lo, hi) in seen_pairs:
+            raise ValueError(
+                f"duplicate relationship for AS pair {lo}/{hi}: one pair must "
+                f"have a single relationship"
+            )
+        seen_pairs.add((lo, hi))
+
+    for path_index, path in enumerate(paths):
+        if len(path) < 2:
+            raise ValueError(
+                f"path at index {path_index} must list at least two ASes"
+            )
+        if len(set(path)) != len(path):
+            raise ValueError(
+                f"path at index {path_index} repeats an AS: {list(path)!r}; "
+                f"every AS path must be loop-free"
+            )
+        for a, b in zip(path, path[1:]):
+            if as_pair(a, b) not in seen_pairs:
+                raise ValueError(
+                    f"path at index {path_index} has hop AS{a} -> AS{b} without "
+                    f"a listed relationship; every hop must be covered"
+                )
+
+
+def _hop_kind(state: int, a: int, b: int, lo: int, hi: int) -> str:
+    """Classify the directed hop ``a -> b`` on pair ``(lo, hi)``.
+
+    Returns :data:`_HOP_UP` (customer -> provider), :data:`_HOP_PEER` or
+    :data:`_HOP_DOWN` (provider -> customer) for the pair's state.
+    """
+    if state == AS_STATE_PEER:
+        return _HOP_PEER
+    # State c2p-low-customer: only the lo->hi traversal goes uphill.
+    # State c2p-low-provider: only the hi->lo traversal goes uphill.
+    uphill = (b == hi) if state == AS_STATE_C2P_LOW_CUSTOMER else (b == lo)
+    return _HOP_UP if uphill else _HOP_DOWN
+
+
+def path_hop_sequence(
+    path: Sequence[int], states: dict[tuple[int, int], int]
+) -> str:
+    """Return the hop-kind string (``U``/``P``/``D``) for one AS path."""
+    chars = []
+    for a, b in zip(path, path[1:]):
+        lo, hi = as_pair(a, b)
+        chars.append(_hop_kind(states[(lo, hi)], a, b, lo, hi))
+    return "".join(chars)
+
+
+def is_valley_free(hops: str) -> bool:
+    """Whether a ``U``/``P``/``D`` hop sequence obeys the valley-free rule.
+
+    The legal shape is ``U* P? D*``: any number of uphill customer->provider
+    hops, at most one peer hop, then any number of downhill provider->customer
+    hops.  A downhill hop followed by an uphill (or peer) hop is a valley; a
+    peer after a peer or after a downhill hop is illegal too.
+    """
+    if hops.count(_HOP_PEER) > 1:
+        return False
+    if _HOP_PEER not in hops:
+        # U* D*: the only forbidden adjacent transition is downhill -> uphill.
+        return _HOP_DOWN + _HOP_UP not in hops
+    uphill_part, downhill_part = hops.split(_HOP_PEER)
+    return (
+        set(uphill_part) <= {_HOP_UP}
+        and set(downhill_part) <= {_HOP_DOWN}
+    )
+
+
+def _relation_output(lo: int, hi: int, state: int) -> dict:
+    """Serialize one repaired relationship back to the API entry shape."""
+    if state == AS_STATE_C2P_LOW_CUSTOMER:
+        return {"type": "c2p", "customer": lo, "provider": hi}
+    if state == AS_STATE_C2P_LOW_PROVIDER:
+        return {"type": "c2p", "customer": hi, "provider": lo}
+    return {"type": "p2p", "endpoints": [lo, hi]}
+
+
+def as_relationship_repair(
+    relations: Sequence[tuple[int, int, str]],
+    paths: Sequence[Sequence[int]],
+) -> dict | None:
+    """Repair AS relationships minimally so all paths become valley-free.
+
+    ``relations`` holds canonical ``(lo, hi, kind)`` triples (``kind`` is
+    ``"c2p"`` when ``lo`` is the customer, ``"p2c"`` when ``lo`` is the
+    provider, or ``"p2p"``); ``paths`` holds AS-number sequences already
+    validated by :func:`validate_as_batch`.  Each relationship may be changed
+    once to either customer/provider orientation or to a peer relationship,
+    and one pair's repaired relationship is shared across every path using
+    it.  The exact search enumerates all :math:`3^{|R|}` joint states, so the
+    result minimizes the number of changed relationships; among equal-cost
+    repairs the lexicographically smallest sequence of
+    ``(lo, hi, new-token)`` entries sorted by AS pair wins (tokens compare
+    ``c2p`` < ``p2c`` < ``p2p`` textually), which selects a unique plan.
+
+    The response lists the 0-based indices of the paths that violated the
+    valley-free rule under the *original* relationships, the sorted repaired
+    relationships (only changed pairs), and the change count.  ``None`` is
+    returned when no joint assignment makes every path valley-free (the
+    caller maps this to HTTP 409).
+    """
+    pairs = sorted((lo, hi) for lo, hi, _kind in relations)
+    original_states = {
+        (lo, hi): relation_state(lo, hi, kind)
+        for lo, hi, kind in relations
+    }
+
+    violating_indices = [
+        index
+        for index, path in enumerate(paths)
+        if not is_valley_free(path_hop_sequence(path, original_states))
+    ]
+
+    # Enumerate joint states in lexicographic per-pair order; cost first,
+    # then the sorted new-relation sequence, so the comparison below keeps
+    # exactly the required unique optimum.
+    best_cost: int | None = None
+    best_key: tuple[tuple[int, int, str], ...] | None = None
+    best_states: dict[tuple[int, int], int] | None = None
+    for combination in product(AS_RELATION_STATES, repeat=len(pairs)):
+        states = {
+            pair: state for pair, state in zip(pairs, combination, strict=True)
+        }
+        if not all(
+            is_valley_free(path_hop_sequence(path, states)) for path in paths
+        ):
+            continue
+        changed_pairs = [
+            pair for pair in pairs if states[pair] != original_states[pair]
+        ]
+        cost = len(changed_pairs)
+        tie_key = tuple(
+            (lo, hi, AS_STATE_TOKEN[states[(lo, hi)]])
+            for lo, hi in changed_pairs
+        )
+        if (
+            best_cost is None
+            or cost < best_cost
+            or (cost == best_cost and tie_key < best_key)
+        ):
+            best_cost, best_key, best_states = cost, tie_key, states
+
+    if best_states is None:
+        return None
+
+    return {
+        "violating_paths": violating_indices,
+        "repairs": [
+            _relation_output(lo, hi, best_states[(lo, hi)])
+            for lo, hi, _token in best_key
+        ],
+        "change_count": best_cost,
     }

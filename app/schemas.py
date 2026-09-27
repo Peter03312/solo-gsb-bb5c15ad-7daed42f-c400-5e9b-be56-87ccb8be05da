@@ -7,15 +7,20 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import (
+    AS_PATH_LIMIT,
+    AS_RELATION_LIMIT,
     MINIMIZE_POLICY_RULE_LIMIT,
     _MAX_PREFIXLEN,
     _parse_nameserver,
     _parse_reverse_cidr,
     _validate_reverse_batch,
+    canonical_relation,
+    parse_asn,
     parse_address,
     parse_key_hex,
     parse_network,
     parse_strict_cidr,
+    validate_as_batch,
 )
 
 
@@ -760,4 +765,138 @@ class RoaCoverageResponse(BaseModel):
             "candidate region, sorted by network address; the pieces tile "
             "the whole scope."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /as-relationship-repair
+# ---------------------------------------------------------------------------
+
+
+class CustomerProviderRelation(BaseModel):
+    type: Literal["c2p"] = Field(
+        description="Customer-to-provider relationship; the direction is given.",
+    )
+    customer: int = Field(
+        ge=0,
+        le=4294967295,
+        description="Customer AS number (32-bit unsigned, 0 through 4294967295).",
+    )
+    provider: int = Field(
+        ge=0,
+        le=4294967295,
+        description="Provider AS number (32-bit unsigned, 0 through 4294967295).",
+    )
+
+    @field_validator("customer", "provider")
+    @classmethod
+    def _validate_asn(cls, value: int) -> int:
+        # Booleans pass Pydantic's integer coercion; reject them explicitly.
+        return parse_asn(value)
+
+    @model_validator(mode="after")
+    def _validate_distinct_endpoints(self) -> "CustomerProviderRelation":
+        if self.customer == self.provider:
+            raise ValueError(
+                f"customer/provider relationship must link two distinct ASes, "
+                f"got AS {self.customer} on both sides"
+            )
+        return self
+
+
+class PeerRelation(BaseModel):
+    type: Literal["p2p"] = Field(
+        description="Peering relationship; the link is undirected.",
+    )
+    endpoints: list[int] = Field(
+        min_length=2,
+        max_length=2,
+        description="The two peering AS numbers (32-bit unsigned); order is irrelevant.",
+    )
+
+    @field_validator("endpoints")
+    @classmethod
+    def _validate_endpoints(cls, values: list[int]) -> list[int]:
+        parsed = [parse_asn(value) for value in values]
+        if parsed[0] == parsed[1]:
+            raise ValueError(
+                f"peer relationship must link two distinct ASes, got AS "
+                f"{parsed[0]} on both sides"
+            )
+        return parsed
+
+
+class AsRelationshipRepairRequest(BaseModel):
+    relationships: list[CustomerProviderRelation | PeerRelation] = Field(
+        default_factory=list,
+        max_length=AS_RELATION_LIMIT,
+        description=(
+            "At most 9 undirected AS relationships. A customer/provider "
+            "relationship must state customer and provider explicitly; a peer "
+            "relationship lists its two endpoints without a direction. One AS "
+            "pair must carry exactly one relationship."
+        ),
+    )
+    paths: list[list[int]] = Field(
+        default_factory=list,
+        max_length=AS_PATH_LIMIT,
+        description=(
+            "At most 20 AS paths, each ordered from origin to receiver. "
+            "Every path must be loop-free (no repeated AS) and every "
+            "consecutive AS pair must have a listed relationship."
+        ),
+    )
+
+    @field_validator("paths")
+    @classmethod
+    def _validate_path_asns(cls, values: list[list[int]]) -> list[list[int]]:
+        for path in values:
+            for asn in path:
+                parse_asn(asn)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_batch(self) -> "AsRelationshipRepairRequest":
+        # Cross-entry checks (counts, duplicate pairs, loop-free paths,
+        # every hop covered) mirror the core validator; the ValueError raised
+        # here is turned by FastAPI into an HTTP 422 response.
+        relations = [canonical_relation(entry.model_dump())
+                     for entry in self.relationships]
+        validate_as_batch(relations, self.paths)
+        return self
+
+
+class RepairedCustomerProvider(BaseModel):
+    type: Literal["c2p"] = Field(
+        description="Repaired customer-to-provider relationship.",
+    )
+    customer: int = Field(description="Customer AS number after the repair.")
+    provider: int = Field(description="Provider AS number after the repair.")
+
+
+class RepairedPeer(BaseModel):
+    type: Literal["p2p"] = Field(
+        description="Repaired peering relationship.",
+    )
+    endpoints: list[int] = Field(
+        description="The two peering AS numbers after the repair.",
+    )
+
+
+class AsRelationshipRepairResponse(BaseModel):
+    violating_paths: list[int] = Field(
+        description=(
+            "0-based indices of the paths that violate the valley-free rule "
+            "under the original relationships, in ascending order."
+        ),
+    )
+    repairs: list[RepairedCustomerProvider | RepairedPeer] = Field(
+        description=(
+            "The changed relationships after the repair, sorted by AS pair "
+            "(smaller AS number first); pairs already correct are omitted. "
+            "One pair's repaired relationship applies to every path using it."
+        ),
+    )
+    change_count: int = Field(
+        description="Number of changed relationships; the minimum feasible.",
     )

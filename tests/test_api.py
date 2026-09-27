@@ -1815,3 +1815,282 @@ def test_roa_coverage_is_documented_in_openapi():
     ]
     response_schema = spec["components"]["schemas"]["RoaCoverageResponse"]
     assert set(response_schema["properties"]) == {"partitions"}
+
+# --------------------------------------------------------------------------
+# POST /as-relationship-repair
+# --------------------------------------------------------------------------
+
+
+def test_as_relationship_repair_minimum_change_with_lex_tie_break():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 4, "provider": 1},
+                {"type": "c2p", "customer": 3, "provider": 1},
+                {"type": "c2p", "customer": 3, "provider": 2},
+            ],
+            "paths": [[4, 1, 3, 2]],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_paths": [0],
+        "repairs": [{"type": "c2p", "customer": 1, "provider": 3}],
+        "change_count": 1,
+    }
+
+
+def test_as_relationship_repair_noop_returns_empty_repairs():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 1, "provider": 2},
+                {"type": "p2p", "endpoints": [2, 3]},
+                {"type": "c2p", "customer": 4, "provider": 3},
+            ],
+            "paths": [[1, 2, 3, 4]],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_paths": [],
+        "repairs": [],
+        "change_count": 0,
+    }
+
+
+def test_as_relationship_repair_one_shared_fix_for_multiple_paths():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 1, "provider": 2},
+                {"type": "c2p", "customer": 3, "provider": 2},
+                {"type": "c2p", "customer": 3, "provider": 4},
+                {"type": "p2p", "endpoints": [5, 3]},
+                {"type": "c2p", "customer": 6, "provider": 2},
+            ],
+            "paths": [[1, 2, 3, 4], [5, 3, 2, 6]],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["violating_paths"] == [0, 1]
+    assert data["change_count"] == 1
+    assert data["repairs"] == [
+        {"type": "c2p", "customer": 2, "provider": 3}]
+
+
+def test_as_relationship_repair_peer_to_c2p():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "p2p", "endpoints": [1, 2]},
+                {"type": "p2p", "endpoints": [2, 3]},
+            ],
+            "paths": [[1, 2, 3]],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_paths": [0],
+        "repairs": [{"type": "c2p", "customer": 1, "provider": 2}],
+        "change_count": 1,
+    }
+
+
+def test_as_relationship_repair_empty_batch_is_valid():
+    response = client.post("/as-relationship-repair", json={})
+    assert response.status_code == 200
+    assert response.json() == {
+        "violating_paths": [], "repairs": [], "change_count": 0}
+
+
+def test_as_relationship_repair_infeasible_returns_409():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "p2p", "endpoints": [1, 2]},
+                {"type": "p2p", "endpoints": [1, 3]},
+                {"type": "p2p", "endpoints": [1, 4]},
+                {"type": "p2p", "endpoints": [2, 3]},
+                {"type": "p2p", "endpoints": [2, 4]},
+                {"type": "p2p", "endpoints": [3, 4]},
+            ],
+            "paths": [
+                [2, 1, 3], [2, 1, 4], [3, 1, 4],
+                [1, 2, 3], [1, 2, 4], [3, 2, 4],
+                [1, 3, 2], [1, 4, 2],
+            ],
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert "repairs" not in body
+    assert "valley-free" in body["detail"]
+
+
+def test_as_relationship_repair_too_many_relationships_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "p2p", "endpoints": [i, i + 1]}
+                for i in range(10)
+            ],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+    assert "9" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_too_many_paths_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "p2p", "endpoints": [1, 2]}],
+            "paths": [[1, 2]] * 21,
+        },
+    )
+    assert response.status_code == 422
+    assert "20" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_duplicate_pair_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 1, "provider": 2},
+                {"type": "c2p", "customer": 2, "provider": 1},
+            ],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+    assert "duplicate relationship" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_repeated_as_in_path_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 1, "provider": 2},
+                {"type": "c2p", "customer": 3, "provider": 2},
+            ],
+            "paths": [[1, 2, 3, 1]],
+        },
+    )
+    assert response.status_code == 422
+    assert "repeats an AS" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_single_as_path_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "p2p", "endpoints": [1, 2]}],
+            "paths": [[1]],
+        },
+    )
+    assert response.status_code == 422
+    assert "at least two ASes" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_hop_without_relationship_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "c2p", "customer": 1, "provider": 2}],
+            "paths": [[1, 2, 3]],
+        },
+    )
+    assert response.status_code == 422
+    assert "without a listed relationship" in response.json()["detail"][0]["msg"]
+
+
+def test_as_relationship_repair_self_relationship_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "c2p", "customer": 5, "provider": 5}],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "p2p", "endpoints": [5, 5]}],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_as_relationship_repair_asn_out_of_range_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [
+                {"type": "c2p", "customer": 4294967296, "provider": 2}
+            ],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "p2p", "endpoints": [1, 2]}],
+            "paths": [[1, -2]],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_as_relationship_repair_unknown_type_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "sibling", "endpoints": [1, 2]}],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_as_relationship_repair_peer_needs_two_endpoints_returns_422():
+    response = client.post(
+        "/as-relationship-repair",
+        json={
+            "relationships": [{"type": "p2p", "endpoints": [1]}],
+            "paths": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_as_relationship_repair_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/as-relationship-repair" in spec["paths"]
+    operation = spec["paths"]["/as-relationship-repair"]["post"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "minimum_change_with_lex_tie_break" in examples
+    assert "no_feasible_repair" in examples
+    response_schema = spec["components"]["schemas"][
+        "AsRelationshipRepairResponse"]
+    assert set(response_schema["properties"]) == {
+        "violating_paths", "repairs", "change_count"}

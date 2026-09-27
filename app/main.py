@@ -1,6 +1,6 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
 /audit-rules, /minimize-policy, /allocate, /anonymize,
-/reverse-delegations and /roa-coverage."""
+/reverse-delegations, /roa-coverage and /as-relationship-repair."""
 
 from __future__ import annotations
 
@@ -9,7 +9,9 @@ from fastapi import FastAPI, HTTPException
 from app.policy import (
     allocate,
     anonymize,
+    as_relationship_repair,
     audit_rules,
+    canonical_relation,
     compare,
     evaluate,
     minimize_policy,
@@ -23,6 +25,8 @@ from app.schemas import (
     AllocateResponse,
     AnonymizeRequest,
     AnonymizeResponse,
+    AsRelationshipRepairRequest,
+    AsRelationshipRepairResponse,
     AuditRulesRequest,
     AuditRulesResponse,
     CompareRequest,
@@ -53,11 +57,16 @@ app = FastAPI(
         "and strict CIDRs with an HMAC-SHA256 key for safe list sharing; "
         "and plan reverse-DNS delegations for the IPv4 networks of one /24 "
         "(direct in-addr.arpa NS for a /24, RFC 2317 range-label subzones "
-        "plus per-address CNAMEs for /25-/32); and map RPKI ROA "
+        "plus per-address CNAMEs for /25-/32); map RPKI ROA "
         "valid/invalid/unknown coverage for every candidate route of one "
-        "prefix length inside a scope as a minimal CIDR status partition."
+        "prefix length inside a scope as a minimal CIDR status partition; "
+        "and repair undirected AS customer/provider/peer relationships with "
+        "the minimum number of changes so that every supplied origin-to-"
+        "receiver AS path obeys the valley-free (uphill*/peer?/downhill*) "
+        "rule, returning the originally violating path indices, the shared "
+        "relationship repairs and the change count."
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -947,3 +956,114 @@ def roa_coverage_report(request: RoaCoverageRequest) -> dict:
         request.prefix_length,
         [(item.cidr, item.asn, item.max_length) for item in request.roas],
     )
+
+
+@app.post(
+    "/as-relationship-repair",
+    response_model=AsRelationshipRepairResponse,
+    tags=["policy"],
+    summary="Repair AS relationships so every AS path is valley-free",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "minimum_change_with_lex_tie_break": {
+                            "summary": (
+                                "One reversed hop creates a down-up valley; "
+                                "two different single-edge repairs exist, and "
+                                "the tie breaks to the smaller AS pair"
+                            ),
+                            "value": {
+                                "relationships": [
+                                    {"type": "c2p", "customer": 4, "provider": 1},
+                                    {"type": "c2p", "customer": 3, "provider": 1},
+                                    {"type": "c2p", "customer": 3, "provider": 2}
+                                ],
+                                "paths": [[4, 1, 3, 2]],
+                            },
+                        },
+                        "no_feasible_repair": {
+                            "summary": (
+                                "The 4 ASes are fully meshed; the eight "
+                                "2-hop paths rule out every joint assignment "
+                                "-> HTTP 409"
+                            ),
+                            "value": {
+                                "relationships": [
+                                    {"type": "p2p", "endpoints": [1, 2]},
+                                    {"type": "p2p", "endpoints": [1, 3]},
+                                    {"type": "p2p", "endpoints": [1, 4]},
+                                    {"type": "p2p", "endpoints": [2, 3]},
+                                    {"type": "p2p", "endpoints": [2, 4]},
+                                    {"type": "p2p", "endpoints": [3, 4]}
+                                ],
+                                "paths": [
+                                    [2, 1, 3], [2, 1, 4], [3, 1, 4],
+                                    [1, 2, 3], [1, 2, 4], [3, 2, 4],
+                                    [1, 3, 2], [1, 4, 2]
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "Indices of the paths that violated the rule under the "
+                "original relationships, the minimum-cardinality repaired "
+                "relationships (shared across paths), and the change count."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "minimum_change_with_lex_tie_break": {
+                            "summary": "Pair 1/3 is flipped to customer 1 / provider 3",
+                            "value": {
+                                "violating_paths": [0],
+                                "repairs": [
+                                    {"type": "c2p", "customer": 1, "provider": 3}
+                                ],
+                                "change_count": 1,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        409: {
+            "description": (
+                "No joint assignment of the listed relationships makes every "
+                "path valley-free; no partial repair is returned."
+            ),
+        },
+        422: {
+            "description": (
+                "More than 9 relationships or 20 paths, an invalid AS "
+                "number, a duplicate relationship for one AS pair, a path "
+                "with fewer than two ASes or a repeated AS, or a hop whose "
+                "AS pair has no listed relationship."
+            ),
+        },
+    },
+)
+def repair_as_relationships(request: AsRelationshipRepairRequest) -> dict:
+    relations = [
+        canonical_relation(entry.model_dump())
+        for entry in request.relationships
+    ]
+    result = as_relationship_repair(relations, request.paths)
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no assignment of the listed relationships makes every "
+                "path valley-free; no partial repair returned"
+            ),
+        )
+    return result
